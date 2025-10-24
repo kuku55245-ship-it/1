@@ -3,8 +3,6 @@ name: Tailscale Stop/Cleanup (delete devices by prefix)
 on:
   workflow_dispatch:
     inputs:
-      ts_tailnet:  { description: "Tailscale tailnet (e.g. you@gmail.com)", required: true }
-      ts_api_key:  { description: "Tailscale API key (device admin, no Bearer)", required: true }
       base_prefix: { description: "Hostname prefix to delete (e.g. bullet)", required: true, default: "bullet" }
       max_count:   { description: "Max devices to delete", required: false, default: "10" }
       dry_run:     { description: "true = list only; false = delete", required: false, default: "false" }
@@ -19,13 +17,19 @@ defaults:
 jobs:
   stop:
     runs-on: ubuntu-latest
+    env:
+      TS_TAILNET: ${{ secrets.TS_TAILNET }}
+      TS_API_KEY: ${{ secrets.TS_API_KEY }}
     steps:
       - name: Delete devices with prefix
         run: |
           function Yes($v){ "$v" -match '^(?i:true|1|yes|on)$' }
 
-          $auth = [Convert]::ToBase64String([Text.Encoding]::ASCII.GetBytes("${{ inputs.ts_api_key }}:"))
-          $tn = [uri]::EscapeDataString("${{ inputs.ts_tailnet }}")
+          if (-not $env:TS_API_KEY) { Write-Error "TS_API_KEY secret is not set."; exit 1 }
+          if (-not $env:TS_TAILNET) { Write-Error "TS_TAILNET secret is not set."; exit 1 }
+
+          $auth = [Convert]::ToBase64String([Text.Encoding]::ASCII.GetBytes("$($env:TS_API_KEY):"))
+          $tn = [uri]::EscapeDataString($env:TS_TAILNET)
           $prefix = "${{ inputs.base_prefix }}"
           $max = [int]"${{ inputs.max_count }}"
           $dry = Yes("${{ inputs.dry_run }}")
@@ -50,3 +54,4 @@ jobs:
             } catch { Write-Warning "Failed to delete $($d.hostname): $($_.Exception.Message)" }
           }
           Write-Host "Cleanup complete."
+
