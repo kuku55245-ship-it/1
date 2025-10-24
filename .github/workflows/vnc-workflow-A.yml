@@ -1,0 +1,219 @@
+name: VNC + Tailscale + Android Studio (A) [SECURE]
+
+on:
+  workflow_dispatch:
+    inputs:
+      github_repo:        { description: "GitHub repo to clone (e.g., user/repo)", required: false, default: "namehamzajazz-cloud/1" }
+      quick_test:         { description: "Run 5-minute test", type: boolean, default: false }
+      runtime_minutes:    { description: "Runtime (max 360; default 355 when not test)", required: false, default: "355" }
+      do_purge:           { description: "Purge bullet* devices at start", required: false, default: "true" }
+      cycles:             { description: "0=stop after A; N=handoffs left incl this run", required: false, default: "0" }
+
+permissions:
+  contents: read
+  actions: write
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  vnc:
+    runs-on: ubuntu-latest
+    timeout-minutes: 370
+    steps:
+      - name: Install Desktop, VNC, Java, and Android Studio
+        run: |
+          echo "Installing desktop environment (XFCE), VNC, and utilities..."
+          sudo apt-get update
+          sudo apt-get install -y xfce4 xfce4-goodies dbus-x11 x11vnc gnome-terminal xvfb jq git
+          
+          echo "Installing Android Studio via snap. This will take a long time..."
+          sudo snap install android-studio --classic
+          echo "Android Studio installation complete."
+
+      - name: Install Java JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '17'
+
+      - name: Clone Project Repository
+        if: inputs.github_repo != ''
+        run: |
+          echo "Cloning ${{ inputs.github_repo }}..."
+          cd /home/runner/
+          git clone "https://github.com/${{ inputs.github_repo }}.git"
+          REPO_NAME=$(basename "${{ inputs.github_repo }}")
+          sudo chown -R runner:runner "/home/runner/$REPO_NAME"
+          echo "Repository cloned to /home/runner/$REPO_NAME"
+
+      - name: Decide hostname + runtime
+        run: |
+          echo "TS_HOSTNAME=bullet" | sudo tee -a $GITHUB_ENV
+
+          function Yes() { [[ "$1" =~ ^(true|1|yes|on)$ ]]; }
+          function IntOr() { 
+            if [[ "$1" =~ ^[0-9]+$ ]]; then echo "$1"; else echo "$2"; fi 
+          }
+          
+          RUNTIME=$(IntOr "${{ inputs.runtime_minutes }}" 355)
+          if Yes "${{ inputs.quick_test }}"; then RUNTIME=5; fi
+          if ! Yes "${{ inputs.quick_test }}" && [[ $RUNTIME -lt 6 ]]; then RUNTIME=355; fi
+          if [[ $RUNTIME -gt 360 ]]; then RUNTIME=355; fi
+          
+          echo "RUNTIME_MINUTES=$RUNTIME" | sudo tee -a $GITHUB_ENV
+          echo "Hostname: bullet  | Runtime: $RUNTIME"
+
+      - name: Purge bullet* devices (with clearer error)
+        # Use secrets from GitHub
+        env:
+          TS_API_KEY: ${{ secrets.TS_API_KEY }}
+          TS_TAILNET: ${{ secrets.TS_TAILNET }}
+        run: |
+          if [[ "${{ inputs.do_purge }}" == "true" ]]; then
+            echo "Attempting to purge bullet* devices..."
+            
+            TN_ESCAPED=$(python3 -c "import urllib.parse; print(urllib.parse.quote('''$TS_TAILNET'''))")
+            if [[ -z "$TN_ESCAPED" ]]; then
+              echo "::error::Failed to URL-encode tailnet."
+              exit 1
+            fi
+            
+            DEVICES_URL="https://api.tailscale.com/api/v2/tailnet/$TN_ESCAPED/devices"
+            echo "Listing devices from $DEVICES_URL"
+            
+            HTTP_RESPONSE=$(curl -s --user "$TS_API_KEY:" "$DEVICES_URL" --write-out "HTTP_STATUS:%{http_code}" 2> curl_error.log)
+            CURL_EXIT_CODE=$?
+            
+            if [[ $CURL_EXIT_CODE -ne 0 ]]; then
+              HTTP_STATUS=$(echo "$HTTP_RESPONSE" | sed -n 's/.*HTTP_STATUS://p')
+              echo "::error::curl command failed with exit code $CURL_EXIT_CODE."
+              echo "::error::HTTP Status from server: $HTTP_STATUS"
+              echo "::error::This almost certainly means your 'TS_API_KEY' secret is invalid or your 'TS_TAILNET' secret is wrong."
+              echo "CURL Error Details:"
+              cat curl_error.log
+              exit 1
+            fi
+            
+            DEVICES=$(echo "$HTTP_RESPONSE" | sed 's/HTTP_STATUS:.*//g')
+            DEVICE_IDS=$(echo "$DEVICES" | jq -r '.devices[] | select(.hostname | startswith("bullet")) | .id')
+            
+            if [[ -z "$DEVICE_IDS" ]]; then
+              echo "No bullet* devices found to purge."
+            else
+              for ID in $DEVICE_IDS; do
+                echo "Deleting device $ID..."
+                curl -s -f -X DELETE --user "$TS_API_KEY:" "https://api.tailscale.com/api/v2/device/$ID"
+              done
+              echo "Purge complete."
+            fi
+          else
+            echo "Purge disabled."
+          fi
+
+      - name: Install + Up Tailscale
+        # Use secret
+        env:
+          TS_AUTHKEY: ${{ secrets.TS_AUTHKEY }}
+        run: |
+          set -e
+          curl -fsSL https://tailscale.com/install.sh | sh
+          sudo tailscale up --authkey "$TS_AUTHKEY" --hostname "$TS_HOSTNAME" --accept-dns=true --accept-routes=true
+          TAILSCALE_IP=$(tailscale ip -4)
+          echo "TAILSCALE_IP=$TAILSCALE_IP" | sudo tee -a $GITHUB_ENV
+          echo "Tailscale IPv4: $TAILSCALE_IP"
+
+      - name: Start VNC Desktop
+        # Use secret
+        env:
+          VNC_PASSWORD: ${{ secrets.VNC_PASSWORD }}
+        run: |
+          echo "Starting virtual display and desktop..."
+          export DISPLAY=:1
+          Xvfb :1 -screen 0 1920x1080x16 &
+          sleep 5
+          startxfce4 &
+          sleep 5
+          
+          echo "Starting VNC server..."
+          # Create a password file
+          echo "$VNC_PASSWORD" | vncpasswd -f > $HOME/.vncpasswd
+          chmod 600 $HOME/.vncpasswd
+
+          # Read password from file, NOT from a loggable command
+          x11vnc -display :1 -forever -rfbauth $HOME/.vncpasswd -bg -rfbport 5900
+          sleep 5
+          
+          echo "--------------------------------------------------------"
+          echo "VNC Server Ready!"
+          echo "Connect with your VNC Client to:"
+          echo "Host: $TAILSCALE_IP"
+          echo "Port: 5900"
+          echo "Password: (Use the password you stored in GitHub Secrets)"
+          echo "--------------------------------------------------------"
+
+      - name: Keep alive (to ${{ env.RUNTIME_MINUTES }} mins)
+        run: |
+          MINS=${{ env.RUNTIME_MINUTES }}
+          END_TIME=$(( $(date +%s) + (MINS * 60) ))
+          while (($(date +%s) < $END_TIME)); do
+            echo "[VNC] Heartbeat $(date +"%H:%M:%S") | Ends at $(date -d @$END_TIME +"%H:%M:%S")"
+            sleep 60
+          done
+
+      - name: Dispatch next or stop
+        if: always()
+        env:
+          # Pass secrets to the dispatch payload
+          TS_TAILNET: ${{ secrets.TS_TAILNET }}
+          TS_API_KEY: ${{ secrets.TS_API_KEY }}
+          TS_AUTHKEY: ${{ secrets.TS_AUTHKEY }}
+          VNC_PASSWORD: ${{ secrets.VNC_PASSWORD }}
+        run: |
+          CYCLES=${{ inputs.cycles }}
+          if [[ $CYCLES -gt 0 ]]; then
+            NEXT_CYCLES=$((CYCLES - 1))
+            if [[ $NEXT_CYCLES -le 0 ]]; then
+              echo "Dispatching STOP."
+              # Note: We are passing secrets to the 'stop' workflow
+              PAYLOAD_JSON=$(jq -n \
+                --arg tn "$TS_TAILNET" \
+                --arg tk "$TS_API_KEY" \
+                '{ts_tailnet: $tn, ts_api_key: $tk, base_prefix: "bullet", max_count: "10", dry_run: "false"}')
+              BODY_JSON=$(jq -n \
+                --arg ref "${{ github.ref_name }}" \
+                --argjson inputs "$PAYLOAD_JSON" \
+                '{ref: $ref, inputs: $inputs}')
+              curl -s -X POST -H "Authorization: Bearer ${{ github.token }}" \
+                   -H "Accept: application/vnd.github+json" \
+                   -d "$BODY_JSON" \
+                   "https://api.github.com/repos/${{ github.repository }}/actions/workflows/vnc-tailscale-stop.yml/dispatches"
+            else
+              echo "Dispatching Workflow B with cycles=$NEXT_CYCLES"
+              # We must pass the secrets to the next workflow (A -> B)
+              # GitHub Secrets are NOT automatically available to called workflows
+              PAYLOAD_JSON=$(jq -n \
+                --arg gr "${{ inputs.github_repo }}" \
+                --arg tn "$TS_TAILNET" \
+                --arg tk "$TS_API_KEY" \
+                --arg ta "$TS_AUTHKEY" \
+                --arg vp "$VNC_PASSWORD" \
+                --arg qt "${{ inputs.quick_test }}" \
+                --arg rt "${{ inputs.runtime_minutes }}" \
+                --arg dp "${{ inputs.do_purge }}" \
+                --arg cy "$NEXT_CYCLES" \
+                '{github_repo: $gr, ts_tailnet: $tn, ts_api_key: $tk, ts_authkey: $ta, vnc_password: $vp, quick_test: $qt, runtime_minutes: $rt, do_purge: $dp, cycles: $cy}')
+              BODY_JSON=$(jq -n \
+                --arg ref "${{ github.ref_name }}" \
+                --argjson inputs "$PAYLOAD_JSON" \
+                '{ref: $ref, inputs: $inputs}')
+              curl -s -X POST -H "Authorization: Bearer ${{ github.token }}" \
+                   -H "Accept: application/vnd.github+json" \
+                   -d "$BODY_JSON" \
+                   "https://api.github.com/repos/${{ github.repository }}/actions/workflows/vnc-workflow-B.yml/dispatches"
+            fi
+          else
+            echo "No cycles configured. Done."
+          fi
+
