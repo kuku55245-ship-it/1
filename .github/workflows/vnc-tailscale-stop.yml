@@ -1,0 +1,77 @@
+name: Tailscale Stop/Cleanup (delete devices by prefix) [SECURE]
+
+on:
+  workflow_dispatch:
+    # This workflow is CALLED BY workflow A/B.
+    # It must accept the secrets as inputs.
+    inputs:
+      ts_tailnet:  { description: "Tailscale tailnet", required: true }
+      ts_api_key:  { description: "Tailscale API key", required: true }
+      base_prefix: { description: "Hostname prefix to delete (e.g. bullet)", required: true, default: "bullet" }
+      max_count:   { description: "Max devices to delete", required: false, default: "10" }
+      dry_run:     { description: "true = list only; false = delete", required: false, default: "false" }
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  stop:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Delete devices with prefix
+        # Use the inputs passed from the calling workflow
+        env:
+          TS_API_KEY: ${{ inputs.ts_api_key }}
+          TS_TAILNET: ${{ inputs.ts_tailnet }}
+        run: |
+          echo "Starting cleanup..."
+          TN_ESCAPED=$(python3 -c "import urllib.parse; print(urllib.parse.quote('''$TS_TAILNET'''))")
+          PREFIX="${{ inputs.base_prefix }}"
+          MAX_COUNT="${{ inputs.max_count }}"
+          DRY_RUN="${{ inputs.dry_run }}"
+
+          DEVICES_URL="https://api.tailscale.com/api/v2/tailnet/$TN_ESCAPED/devices"
+          echo "Fetching devices from $DEVICES_URL"
+          
+          HTTP_RESPONSE=$(curl -s --user "$TS_API_KEY:" "$DEVICES_URL" --write-out "HTTP_STATUS:%{http_code}" 2> curl_error.log)
+          CURL_EXIT_CODE=$?
+          
+          if [[ $CURL_EXIT_CODE -ne 0 ]]; then
+            HTTP_STATUS=$(echo "$HTTP_RESPONSE" | sed -n 's/.*HTTP_STATUS://p')
+            echo "::error::curl command failed with exit code $CURL_EXIT_CODE."
+            echo "::error::HTTP Status from server: $HTTP_STATUS"
+            echo "::error::This almost certainly means your 'ts_api_key' secret is invalid or your 'ts_tailnet' secret is wrong."
+            echo "CURL Error Details:"
+            cat curl_error.log
+            exit 1
+          fi
+
+          DEVICES=$(echo "$HTTP_RESPONSE" | sed 's/HTTP_STATUS:.*//g')
+          TARGETS_JSON=$(echo "$DEVICES" | jq -c --arg prefix "$PREFIX" --argjson max "$MAX_COUNT" '[.devices[] | select(.hostname | startswith($prefix))] | .[0:$max]')
+          TARGET_COUNT=$(echo "$TARGETS_JSON" | jq 'length')
+
+          if [[ $TARGET_COUNT -eq 0 ]]; then
+            echo "No matching devices found with prefix '$PREFIX'."
+            exit 0
+          fi
+
+          echo "Found $TARGET_COUNT device(s) with prefix '$PREFIX':"
+          echo "$TARGETS_JSON" | jq -r '.[] | " - \(.hostname) [\(.id)]"'
+
+          if [[ "$DRY_RUN" == "true" ]]; then
+            echo "Dry run: no deletions performed."
+            exit 0
+          fi
+
+          echo "Attempting to delete devices..."
+          for ID in $(echo "$TARGETS_JSON" | jq -r '.[].id'); do
+            echo "Deleting device $ID..."
+            curl -s -f -X DELETE --user "$TS_API_KEY:" "https://api.tailscale.com/api/v2/device/$ID"
+            echo "Deleted device $ID."
+          done
+          echo "Cleanup complete."
+
