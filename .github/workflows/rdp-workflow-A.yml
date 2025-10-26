@@ -37,7 +37,10 @@ jobs:
 
   rdp:
     needs: setup
-    runs-on: ubuntu-latest-8-cores # Using 8-core paid runner
+    # --- THIS IS THE CHANGE ---
+    # Requesting a 4-core VM (Paid feature)
+    runs-on: ubuntu-latest-4-cores
+    # --- END OF CHANGE ---
     strategy:
       matrix: ${{ fromJson(needs.setup.outputs.matrix) }}
       max-parallel: 10
