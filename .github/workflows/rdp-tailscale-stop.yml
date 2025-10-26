@@ -3,6 +3,7 @@ name: Tailscale Stop/Cleanup (delete devices by prefix)
 on:
   workflow_dispatch:
     inputs:
+      # Removed sensitive input: ts_api_key, ts_tailnet
       base_prefix: { description: "Hostname prefix to delete (e.g. bullet)", required: true, default: "bullet" }
       max_count:   { description: "Max devices to delete", required: false, default: "10" }
       dry_run:     { description: "true = list only; false = delete", required: false, default: "false" }
@@ -18,18 +19,17 @@ jobs:
   stop:
     runs-on: ubuntu-latest
     env:
-      TS_TAILNET: ${{ secrets.TS_TAILNET }}
-      TS_API_KEY: ${{ secrets.TS_API_KEY }}
+      # Pass secrets needed for API call
+      TS_API_KEY_SECRET: ${{ secrets.TS_API_KEY }}
+      TS_TAILNET_SECRET: ${{ secrets.TS_TAILNET }}
     steps:
       - name: Delete devices with prefix
         run: |
           function Yes($v){ "$v" -match '^(?i:true|1|yes|on)$' }
 
-          if (-not $env:TS_API_KEY) { Write-Error "TS_API_KEY secret is not set."; exit 1 }
-          if (-not $env:TS_TAILNET) { Write-Error "TS_TAILNET secret is not set."; exit 1 }
-
-          $auth = [Convert]::ToBase64String([Text.Encoding]::ASCII.GetBytes("$($env:TS_API_KEY):"))
-          $tn = [uri]::EscapeDataString($env:TS_TAILNET)
+          # Use secrets from environment variables
+          $auth = [Convert]::ToBase64String([Text.Encoding]::ASCII.GetBytes("${{ env.TS_API_KEY_SECRET }}:"))
+          $tn = [uri]::EscapeDataString("${{ env.TS_TAILNET_SECRET }}")
           $prefix = "${{ inputs.base_prefix }}"
           $max = [int]"${{ inputs.max_count }}"
           $dry = Yes("${{ inputs.dry_run }}")
@@ -42,10 +42,7 @@ jobs:
           Write-Host "Found $($targets.Count) device(s) with prefix '$prefix':"
           $targets | ForEach-Object { Write-Host " - $($_.hostname) [$($_.id)]" }
 
-          if ($dry) {
-            Write-Host "Dry run: no deletions performed."
-            exit 0
-          }
+          if ($dry) { Write-Host "Dry run: no deletions performed."; exit 0 }
 
           foreach ($d in $targets) {
             try {
